@@ -64,8 +64,8 @@ class SparkleFormation
     end
 
     # @return [Hash] resource mapping
-    def map
-      self.class.const_get(:MAP)
+    def map(map_ref=:MAP)
+      self.class.const_get(map_ref)
     end
 
     # Translate stack definition
@@ -94,10 +94,11 @@ class SparkleFormation
     #
     # @param resource_name [String]
     # @param resource_args [Hash]
+    # @param resource_map [Hash]
     # @return [Hash, NilClass] new resource Hash or nil
-    def resource_translation(resource_name, resource_args)
+    def resource_translation(resource_name, resource_args, resource_map=:MAP)
       new_resource = {}
-      lookup = map[:resources][resource_args['Type']]
+      lookup = map(resource_map)[:resources][resource_args['Type']]
       if(lookup.nil?)
         logger.warn "Failed to locate resource type: #{resource_args['Type']}"
         nil

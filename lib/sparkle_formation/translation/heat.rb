@@ -63,6 +63,27 @@ class SparkleFormation
         true
       end
 
+      # Recursively snake case all keys
+      #
+      # @param thing [Object] object on which to snake case keys
+      # @param exceptions [Array] list of keys to exclude from snake casing
+      def snake_keys(thing, exceptions = [])
+        if thing.class == Hash
+          cache = MultiJson.load(MultiJson.dump(thing))
+          cache.each do |k,v|
+            next if exceptions.include?(k)
+            thing.delete(k)
+            new_key = snake(k).to_s
+            thing[new_key] = v
+            snake_keys(thing[new_key], exceptions)
+          end
+        elsif thing.class == Array
+          thing.each do |e|
+            snake_keys(e, exceptions)
+          end
+        end
+      end
+
       # Custom mapping for block device
       #
       # @param value [Object] original property value
@@ -129,15 +150,45 @@ class SparkleFormation
         end
       end
 
+      # Finalizer for translation of AWS::EC2::Subnet to OS::Neutron::Net
       def neutron_net_finalizer(resource_name, new_resource, old_resource)
         new_resource['Properties'] = {}.tap do |properties|
+          # Add a uniquely named OS::Neutron::Subnet resource
           subnet_name = "#{resource_name}_OSNeutronSubnet"
           subnet_resource = MultiJson.load(MultiJson.dump(new_resource))
           subnet_resource['Type'] = 'OS::Neutron::Subnet'
           subnet_resource['Properties']['cidr'] = MultiJson.load(MultiJson.dump(old_resource['Properties']['CidrBlock']))
           subnet_resource['Properties']['network_id'] = { 'Ref' => resource_name }
+          # Add an explicit dependency on the OS::Neutron::Net resource - it
+          # seems to need it in some cases
+          subnet_resource['depends_on'] = resource_name
           translated['Resources'][subnet_name] = subnet_resource
         end 
+      end
+
+      # Finalizer for translation of AWS::AutoScaling::AutoScalingGroup to
+      # OS::Heat::AutoScalingGroup
+      def asg_finalizer(resource_name, new_resource, old_resource)
+        # If a dependency exists on a network resource, add a dependency for
+        # the auto-generated subnet resource
+        if old_resource.has_key?("DependsOn")
+          new_resource['DependsOn'] = [];
+          if old_resource.class == Array
+            old_resource.each do |r|
+              res_camel = camel(r)
+              new_resource['DependsOn'].push(res_camel)
+              if original['Resources'][res_camel]['Type'] == "AWS::EC2::Subnet"
+                new_resource['DependsOn'].push("#{res_camel}_OSNeutronSubnet")
+              end
+            end
+          else
+            res_camel = camel(old_resource['DependsOn'])
+            new_resource['DependsOn'].push(res_camel)
+            if original['Resources'][res_camel]['Type'] == "AWS::EC2::Subnet"
+              new_resource['DependsOn'].push("#{res_camel}_OSNeutronSubnet")
+            end
+          end
+        end
       end
 
       # Finalizer applied to all new resources
@@ -165,7 +216,18 @@ class SparkleFormation
       # @return [Array<String, Object>] name and new value
       # @todo implement
       def autoscaling_group_launchconfig(value, args={})
-        ['resource', value]
+        # Get the original launch configuration
+        lc = original['Resources'][value['Ref']]
+
+        # Translate it
+        res = resource_translation('AWS::AutoScaling::LaunchConfiguration', lc,
+            :LAUNCH_CONFIGURATION_MAP)
+
+        # Fix the case on the resource keys
+        snake_keys(res, ["Ref"])
+
+        # Add it as a resource
+        ['resource', res]
       end
 
       # Default keys to snake cased format (underscore)
@@ -197,6 +259,7 @@ class SparkleFormation
           },
           'AWS::AutoScaling::AutoScalingGroup' => {
             :name => 'OS::Heat::AutoScalingGroup',
+            :finalizer => :asg_finalizer,
             :properties => {
               'Cooldown' => 'cooldown',
               'DesiredCapacity' => 'desired_capacity',
@@ -225,6 +288,41 @@ class SparkleFormation
       FN_MAPPING = {
         'Fn::GetAtt' => 'get_attr',
         'Fn::Join' => 'list_join'  # @todo why is this not working?
+      }
+
+      # Special map for mapping AWS::AutoScaling::LaunchConfiguration
+      LAUNCH_CONFIGURATION_MAP = {
+        :resources => {
+          'AWS::AutoScaling::LaunchConfiguration' => {
+            :name => 'OS::Nova::Server',
+            :properties => {
+              "AssociatePublicIpAddress" => :delete, # @todo see if it is usable in network configuration
+              'BlockDeviceMappings' => :nova_server_block_device_mapping,
+              "EbsOptimized" => :delete,
+              "IamInstanceProfile" => :delete, # @todo see if it is usable
+              'ImageId' => 'image',
+              "InstanceId" => :delete, # @todo verify not needed
+              "InstanceMonitoring" => :delete, # @todo see how this can be used
+              'InstanceType' => 'flavor',
+              "KernelId" => :delete, # @todo see whether this can be used
+              'KeyName' => 'key_name',
+              # NetworkInterfaces is not an AWS::AutoScaling:LaunchConfiguration
+              # property, but it is necessary for OS::Nova::Server resources
+              'NetworkInterfaces' => 'networks',
+              "RamDiskId" => :delete,
+              'SecurityGroups' => 'security_groups',
+              "SpotPrice" => :delete,
+              'UserData' => :nova_server_user_data
+
+              # These attributes are properties of OS::Nova::Server, but
+              # are not properties AWS::AutoScaling::LaunchConfiguration
+              # @todo figure out how to specify them
+              #'AvailabilityZone' => 'availability_zone',
+              #'SecurityGroupIds' => 'security_groups',
+              #'Tags' => 'metadata',
+            }
+          }
+        }
       }
 
     end
